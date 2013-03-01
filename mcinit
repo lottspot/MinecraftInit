@@ -1,0 +1,647 @@
+#!/bin/bash
+
+#Variables needed in config so far:
+#JAVAEXEC: path to Java executable
+#MCJAR: path to server .jar file
+#TMUXEXEC: path to tmux executable
+#USER: user which server will be run as
+#SRVDIR: directory containing main server files; should point to directory containing bukkit/MC .jar file
+#SESSION: name of tmux session running server
+#LOGDIR: directory storing rolled log files
+#WLDSTR: directory storing all minecraft worlds
+#RAMDISK: path to ramdisk
+#WLDBK: backup dir for worlds
+#PLGBK: backup dir for plugins
+#SRVBK: backup dir for main server files
+#LOGARCMAX: Maximum number of log archives to be retained at a given time
+#SRVARCMAX: " for server file archives
+#WLDARCMAX: " for world storage archives
+#PLGARCMAX: " for plugin archives
+#WARN_ON_RAM_CLEAR: Shows warning prompt before running ram clear operation
+
+#Script dependencies:
+#Java
+#MC Server
+#tmux
+#rsync
+
+source initconfig
+SCRIPT=$(echo $0 | awk -F/ '{print $NF}')
+
+main(){
+	# Check script dependencies
+	[[ ! -x ${JAVAEXEC} ]] && echo "Cannot find java executable. Please install java or enter the path to your java executable in the init script config file." && exit 1
+	[[ ! -f ${MCJAR} ]] && echo "Cannot find minecraft .jar file. Please enter the correvt path to your .jar file in the init script config file." && exit 1
+	[[ ! -x ${TMUXEXEC} ]] && echo "Cannot find tmux executable. Please install tmux or enter the path to your tmux executable in the init script config file." && exit 1
+	# Run script as unpriveliged user, execute script from server directory
+	[[ ! $(cat /etc/passwd | egrep \(^${USER}:x:\)) ]] && echo "Cannot run server as ${USER}; user does not exist" && exit 1
+	[[ $(whoami) != ${USER} ]] && echo "Executing as ${USER}..." && su ${USER}
+	cd ${SRVDIR}
+	case $1 in
+		start)
+			if isRunning
+			then
+				echo "Server is already running."
+				exit 0
+			else
+				toRam
+				checkLinks
+				runServer
+			fi
+			;;
+		stop)
+			if isRunning
+			then
+				toDisk
+				haltServer
+				cleanRam
+			else
+				echo "Server is already stopped."
+			fi
+			;;
+		restart)
+			if isRunning
+			then
+				toDisk
+				haltServer
+				checkLinks
+				runServer
+			else
+				echo "Cannot restart: server is stopped"
+			fi
+			;;
+		status)
+			if isRunning
+			then
+				echo "Server is running"
+			else
+				echo "Server is not running"
+			fi
+			;;
+		roll-log)
+			logRoll
+			;;
+		archive)
+			declare -A arcMax arcPrefix
+			case $2 in
+				logs)
+					archiveLogs
+					arcMax[${LOGDIR}]=${LOGARCMAX}
+					arcPrefix[${LOGDIR}]='logs'
+					;;
+				worlds)
+					archiveWorlds
+					arcMax[${WLDBK}]=${WLDARCMAX}
+					arcPrefix[${WLDBK}]='worlds'
+					;;
+				plugins)
+					archivePlugins
+					arcMax[${PLGBK}]=${PLGARCMAX}
+					arcPrefix[${PLGBK}]='plugins'
+					;;
+				server)
+					archiveServer
+					arcMax[${SRVBK}]=${SRVARCMAX}
+					arcPrefix[${SRVBK}]='server'
+					;;
+				all)
+					archiveLogs
+					archiveServer
+					archivePlugins
+					archiveWorlds
+					arcMax[${LOGDIR}]=${LOGARCMAX}
+					arcPrefix[${LOGDIR}]='logs'
+					arcMax[${SRVBK}]=${SRVARCMAX}
+					arcPrefix[${SRVBK}]='server'
+					arcMax[${PLGBK}]=${PLGARCMAX}
+					arcPrefix[${PLGBK}]='plugins'
+					arcMax[${WLDBK}]=${WLDARCMAX}
+					arcPrefix[${WLDBK}]='worlds'
+					;;
+				*)
+					echo "Usage: ${SCRIPT} archive [logs|worlds|plugins|server|all]"
+					exit 0
+					;;
+			esac
+			for dir in ${!arcMax[*]}
+			do
+				if [[ ${arcMax[$dir]} -gt 0 ]]
+				then
+					arcs=($(ls ${dir}))
+					while [[ ${#arcs} -gt ${arcMax[$dir]} ]]
+					do
+						delRemain=$(expr ${#arcs} - ${arcMax[$dir]})
+						echo "Purging ${delRemain} old archive(s) from ${dir}..."
+						archiveRoll ${arcPre[$dir]} 'tar.gz' ${dir}
+						arcs=($(ls ${dir}))
+					done
+				fi
+			done
+			;;
+		restore)
+			declare -A arcPfx rstrDir
+			case $2 in
+				logs)
+					arcPfx[${LOGDIR}]='logs'
+					rstrDir[${LOGDIR}]=${LOGDIR}
+					;;
+				worlds)
+					arcPfx[${WLDBK}]='worlds'
+					dir=$(echo ${WLDSTR} | awk -F/ '{$NF=""; OFS=/; print}')
+					rstrDir[${WLDBK}]=${dir}
+					;;
+				plugins)
+					arcPfx[${PLGBK}]='plugins'
+					rstrDir[${PLGBK}]=${SRVDIR}
+					;;
+				server)
+					arcPfx[${SRVBK}]='server'
+					rstrDir[${WLDBK}]=${SRVDIR}
+					;;
+				all)
+					arcPfx[${LOGDIR}]='logs'
+					arcPfx[${WLDBK}]='worlds'
+					arcPfx[${PLGBK}]='plugins'
+					arcPfx[${SRVBK}]='server'
+					wldDir=$(echo ${WLDSTR} | awk -F/ '{$NF=""; OFS=/; print}')
+					rstrDir[${LOGDIR}]=${LOGDIR}
+					rstrDir[${WLDBK}]=${wldDir}
+					rstrDir[${PLGBK}]=${SRVDIR}
+					rstrDir[${WLDBK}]=${SRVDIR}
+					;;
+				*)
+					echo "Usage: ${SCRIPT} restore [logs|worlds|plugins|server|all] <archive number>"
+					exit 0
+					;;
+			esac
+			for dir in ${!arcPfx[*]}
+			do
+				restoreArchive ${dir} ${rstrDir[$dir]} ${arcPfx[$dir]} 'tar.gz' $3
+			done
+			;;
+		ram)
+			wlds=($(echo $* | awk '{$1=""; $2=""; print}'))
+			i=0
+			while [[ ${i} -lt ${#wlds} ]]
+			do
+				[[ ! -d ${WLDSTR}/${wlds[$i]} ]] && echo "${wlds[$i]} does not exist in ${WLDSTR}. No operation will be performed for this world." && wlds[$i]=''
+				(( i++ ))
+			done
+			[[ ! ${wlds[*]} ]] && exit 0
+			case $2 in
+				on)
+					for wld in ${wlds[*]}
+					do
+						ramdiskOn ${wld}
+					done
+					;;
+				off)
+					for wld in ${wlds[*]}
+					do
+						ramdiskOff ${wld}
+					done
+					;;
+				clear)
+					if [[ ${WARN_ON_RAM_CLEAR} ]] 
+						then
+							echo -n "WARNING: This operation does NOT copy to disk before clearing worlds from RAM. Any changes made to worlds since last to-disk operation was run will be lost. Still proceed? (Y/n) "
+							read cont
+							[[ ${cont} != 'Y' ]] && echo "Aborting operation." && exit 0
+						fi
+					declare -A xstat
+					for wld in ${wlds[*]}
+					do
+						if [[ -e ${RAMDISK}/${wld} ]]
+						then
+							rm -r ${RAMDISK}/${wld}
+							xstat[$wld]=$?
+						else
+							echo "Wolrd ${wld} is not in RAM."
+						fi
+					done
+					for wld in ${!xstat[*]}
+					do
+						if ${xstat[$wld]}
+						then
+							echo "World ${wld} successfully cleared from RAM"
+						else
+							echo "Error ocurred clearing ${wld} from ram. Please investigate in ${RAMDISK}."
+						fi
+					done
+					;;
+				*)
+					echo "Usage: ${SCRIPT} ram [on|off|clear] <world names>"
+					exit 0
+					;;
+			esac
+			;;
+		to-disk)
+			toDisk
+			;;
+		exec)
+			if $2
+			then
+				tmux send -t ${SESSION} "$2" ENTER
+				echo "Executed server command ${2}. Run ${SCRIPT} logtail to check output."
+			else
+				echo
+			fi
+			;;
+		logtail)
+			if [[ $2 -gt 0 ]]
+			then
+				tail -n $2 server.log
+			else
+				tail server.log
+			fi
+			;;
+		console)
+			if ${WARN_ON_CONSOLE_ATTACH}
+			then
+				echo -n "You are about to attach to your minecraft console inside of a tmux session. In order to detach without stopping the server, you will need to enter the tmux command key (default: Ctrl + b) followed by the detatch key (default: d). Continue? (Y/n): "
+				read response
+				[[ ${response} != Y ]] && echo "Aborting..." && exit 0
+			fi
+			tmux attach -t ${SESSION}
+			;;
+	esac
+}
+
+isRunning(){
+	# Check for running server instance; return value of true if running, false if not.
+	if ps a | grep -v grep | grep "${INVOCATION}" > /dev/null
+	then
+		return 0
+	else
+		return 1
+	fi
+}
+
+runServer(){
+	# Initiate server in tmux session
+	tmux new-session -s ${SESSION} "${INVOCATION}"
+	echo -n "Starting minecraft..."
+	# 'cycle' variable tracks how many loops have been executed while waiting for the server to start
+	cycle=0
+	# Initiate loop which continues until both tmux and java are confirmed to be running
+	until [[ \
+		$(tmux list-sessions | egrep ${SESSION}:\ \[0-9\]+ > /dev/null) && \
+		$(ps a | grep -v grep | grep "${INVOCATION}" > /dev/null) \
+	]]
+	do
+		sleep 3
+		# Creates a nice animation while waiting for server start
+		[[ ${cycle} -gt 0 ]] && echo -n "."
+		# Fail out after 10 cycles (30 seconds) with error message
+		if [[ ${cycle} -ge 10 ]]
+		then
+			echo "Sever start failed with the following errors:"
+			[[ ! $(tmux list-sessions | egrep ${SESSION}:\ \[0-9\]+ > /dev/null) ]] && echo "Tmux session did not start."
+			[[ ! $(ps a | grep -v grep | grep "${INVOCATION}" > /dev/null) ]] && echo "Java was unable to start."
+			echo "Call in your sysadmin for backup."
+			exit 1
+		fi
+		(( cycle++ ))
+	done
+	echo "Server started successfully. Attach to console using: ${SCRIPT} attach"
+}
+
+haltServer(){
+	# Send save-all and stop commands to console for graceful shutdown
+	echo "Saving worlds..."
+	tmux send -t ${SESSION} "save-all" ENTER
+	sleep 1
+	tmux send -t ${SESSION} "stop" ENTER
+	echo -n "Stopping minecraft..."
+	cycle=0
+	# Wait for server to shut down
+	until [[ \
+		! $(tmux list-sessions | egrep ${SESSION}:\ \[0-9\]+ > /dev/null) && \
+		! $(ps a | grep -v grep | grep "${INVOCATION}" > /dev/null) \
+	]]
+	do
+		# Add nice animation while waiting for server shutdown
+		sleep 3
+		[[ ${cycle} -gt 0 ]] && echo -n "."
+		# Fail out with error messages if server is not stopped after 20 cycles (60 seconds)
+		if [[ ${cycle} -ge 20 ]]
+		then
+			echo "Sever did not cleanly stop after 60 seconds; you may need to perform the following."
+			if [[ $(ps a | grep -v grep | grep "${INVOCATION}" > /dev/null) ]]
+			then
+				PID=$(ps a | grep -v grep | grep "${INVOCATION}" | awk '{print $1}')
+				echo "Kill Java:"
+				echo "[ kill ${PID} | kill -9 ${PID} ]"
+			else
+				echo "Kill tmux session:"
+				echo "tmux kill-session -t ${SESSION}"
+			fi
+			echo "Or call in your sysadmin for backup."
+			exit 1
+		fi
+		(( cycle++ ))
+	done
+	# Success message
+	echo "Server cleanly shut down."
+}
+
+logRoll(){
+	# Check for log dir, create if does not exist
+	[[ ! -d ${LOGDIR} ]] && mkdir ${LOGDIR}
+	rollName="rolled.$(date +%d-%b-%Y).log"
+	# Create one rolled log per day; if logs rolled multiple times per day, append contents to same file
+	cat server.log >> ${LOGDIR}/${rollName}
+	# Clear log if successfully rolled, else fail out with error message
+	if [[ $? ]]
+	then
+		cp /dev/null server.log
+		echo "Log successfully rolled to ${LOGDIR}/${rollName}"
+	else
+		echo "Log roll failed: unable to write ${LOGDIR}/${rollName}"
+	fi
+}
+
+archiveLogs(){
+	fileNum=0
+	tarName="logs.${fileNum}.tar.gz"
+	# Find first available filename
+	while [[ -f ${LOGDIR}/${tarName} ]]
+	do
+		(( fileNum++ ))
+		tarName="logs.${fileNum}.tar.gz"
+	done
+	cd ${LOGDIR}
+	# Add all logiles to the new archive
+	tar cpzvf ${tarName} ./*.log
+	# Clear logfiles if successfully archived; fail out with error if not
+	if [[ $? ]]
+	then
+		rm ./*.log
+		if [[ $? ]]
+		then
+			echo "Log files successfully archived in ${LOGDIR}/${tarName}"
+		# Provide warning if unable to clear logs
+		else
+			echo "Error ocurred: Archive was created in ${LOGDIR}/${tarName}, but failed to purge old logs from ${LOGDIR}."
+			exit 1
+		fi
+	else
+		echo "Failed to archive logs: could not create tarball in ${LOGDIR}/${tarName}"
+		exit 1
+	fi
+	cd ${SRVDIR}
+}
+
+archiveRoll(){
+	# Find oldest archive, delete it, and rename remaning archives accordingly. Takes 3 arguments
+	# $1: Archive file prefix [Cannot contain a '.' or numeric characters]
+	# $2: Archive file suffix [Cannot contain numeric characters]
+	# $3: Archive file directory
+	cd ${3}
+	rmFile=$(ls | grep "$1\.0\.$2")
+	if [[ ${rmFile} ]]
+	then
+		rm ${rmFile}
+		archives=($(ls | egrep "$1\.[0-9]+\.$2"))
+		for archive in ${archives[*]}
+		do
+			arcNum=$(echo ${archive} | awk -F. '{print $2}')
+			(( arcNum-- ))
+			newName=$(echo ${archive} | sed "s:[0-9]\+:${arcNum}:")
+			mv ${archive} ${newName}
+		done
+		if [[ $? ]]
+		then
+			echo "Log archives successfully rolled."
+		else
+			echo "There was an error rolling the log archives. Please investigate in you logs directory."
+		fi
+	else
+		echo "Cannot roll archives: Unable to locate ${1}.0.${2}"
+		exit 1
+	fi
+	cd ${SRVDIR}
+}
+
+getWorlds(){
+	# Get all worlds and ramdisk information; store in an associative array
+	declare -A worldInRam
+	for wld in $(ls ${WLDSTR})
+	do
+		if [[ -d ${WLDSTR}/${wld} ]]
+		then
+			if [[ -e ${WLDSTR}/${wld}/ramdisk ]]
+			then
+				worldInRam[${wld}]=true
+			else
+				worldInRam[${wld}]=false
+			fi
+		fi
+	done
+}
+
+ramdiskOn(){
+	# Add ramdisk flag
+	[[ ! -e ${WLDSTR}/$1/ramdisk ]] && echo "This file is a flag marking this world as needing to be loaded in  RAM. Its contents are entirely meangingless." > ${WLDSTR}/$1/ramdisk
+}
+
+ramdiskOff(){
+	# Remove ramdisk flag
+	[[ -e ${WLDSTR}/$1/ramdisk ]] && rm ${WLDSTR}/$1/ramdisk
+}
+
+toRam(){
+	# Copy all ramdisk worlds to RAM
+	[[ isRunning ]] && tmux send -t ${SESSION} "save-all" ENTER
+	getWorlds
+	for wld in ${!worldInRam[*]}
+	do
+		if ${worldInRam[$wld]}
+		then
+			if [[ ! -d ${RAMDISK}/${wld} ]]
+			then
+				echo "Copying ${wld} to Ram..."
+				rsync -r ${WLDSTR}/${wld} ${RAMDISK}/${wld}
+				if [[ $? ]]
+				then
+					echo "${wld} copied."
+				else
+					echo "Error copying ${wld}."
+				fi
+			else
+				echo "${wld} already in RAM. skipping..."
+			fi
+
+		fi
+	done
+}
+
+cleanRam(){
+	getWorlds
+	for wld in ${!worldInRam[*]}
+	do
+		if [[ -e ${RAMDISK}/${wld} ]]
+		then
+			rm -rf ${RAMDISK}/${wld}
+		fi
+	done
+}
+
+toDisk(){
+	# Copy all worlds in RAM back to hard disk
+	[[ isRunning ]] && tmux send -t ${SESSION} "save-all" ENTER
+	getWorlds
+	for wld in ${!worldInRam[*]}
+	do
+		if [[ -d ${RAMDISK}/${wld} ]]
+		then
+			rsync -rv ${RAMDISK}/${wld} ${WLDSTR}/${wld}
+		fi
+	done
+}
+
+checkLinks(){
+	# Abort link checks if server is already running
+	[[ isRunning ]] && echo "Cannot change world links while server is running. Please stop server and retry operation." && exit 1
+	getWorlds
+	for wld in ${!worldInRam[*]}
+	do
+		echo "Checking links for ${wld}"
+		# Check first to see if file exists
+		if [[ -e ${wld} ]]
+		then
+			# If file exists, check whether it is a symlink
+			if [[ -L ${wld} ]]
+			# If file is a symlink, check that it is linked to the correct place (RAM for RAM worlds, storage folder for non-RAM worlds)
+			then
+				link=$(ls -l | grep ${wld} | awk '{print $11}')
+				if [[ -d ${RAMDISK}/${wld} ]]
+				then
+					[[ ${link} != ${RAMDISK}/${wld} ]] && ln -sf ${RAMDISK}/${wld} ${wld}
+				else
+					[[ ${link} != $(cd ${WLDSTR}; pwd) ]] && ln -sf $(cd ${WLDSTR}; pwd) ${wld}
+				fi
+				echo "Links OK for ${wld}"
+			# If file already exists in server directory by name of symlink, raise error message and exit
+			else
+				echo "Unable to create link for world ${wld}: filename already exists in ${SRVDIR}"
+				exit 1
+			fi
+		# If file does not exist, create new symlink from correct place
+		else
+			if [[ -d ${RAMDISK}/${wld} ]]
+			then
+				ln -sf ${RAMDISK}/${wld} ${wld}
+			else
+				ln -sf $(cd ${WLDSTR}; pwd) ${wld}
+			fi
+			echo "Links created for ${wld}"
+		fi
+	done
+}
+
+archiveWorlds(){
+	arcNum=0
+	[[ ! -d ${WLDSTR} ]] && echo "Cannot archive worlds: ${WLDSTR} either does not exist or isn't a directory" && exit 1
+	if [[ ! -d ${WLDBK} ]]
+	then 
+		echo "Attempting to create ${WLDBK}"
+		mkdir ${WLDBK}
+		[[ ! $? ]] && echo "Failed to create ${WLDBK}. Please create this directory and try again." && exit 1
+		echo "Created ${WLDBK} successfully"
+	fi
+	while [[ -f "${WLDBK}/worlds.${arcNum}.tar.gz" ]]
+	do
+		(( arcNum++ ))
+	done
+	arcName="worlds.${arcNum}.tar.gz"
+	tar cpzvf ${WLDBK}/${arcName} ${WLDSTR}
+	if [[ $? ]]
+	then
+		echo "Worlds archived successfully to ${WLDBK}/${arcName}"
+	else
+		echo "There was an error archiving world storage folder to ${WLDBK}/${arcName}: please investigate in ${WLDBK}"
+		exit 1
+	fi
+}
+
+archivePlugins(){
+	arcNum=0
+	if [[ ! -d ${PLGBK} ]]
+	then 
+		echo "Attempting to create ${PLGBK}..."
+		mkdir ${PLGBK}
+		[[ ! $? ]] && echo "Failed to create ${PLGBK}. Please create this directory and try again." && exit 1
+		echo "Created ${PLGBK} successfully"
+	fi
+	while [[ -f "${PLGBK}/plugins.${arcNum}.tar.gz" ]]
+	do
+		(( arcNum++ ))
+	done
+	arcName="worlds.${arcNum}.tar.gz"
+	tar cpzvf ${PLGBK}/${arcName} plugins
+	if [[ $? ]]
+	then
+		echo "Plugins archived successfully to ${PLGBK}/${arcName}"
+	else
+		echo "There was an error archiving plugins folder to ${PLGBK}/${arcName}: please investigate in ${PLGBK}"
+	fi
+}
+
+archiveServer(){
+	arcNum=0
+	if [[ ! -d ${SRVBK} ]]
+	then 
+		echo "Attempting to create ${SRVBK}..."
+		mkdir ${SRVBK}
+		[[ ! $? ]] && echo "Failed to create ${SRVBK}. Please create this directory and try again." && exit 1
+		echo "Created ${SRVBK} successfully"
+	fi
+	while [[ -f "${SRVBK}/plugins.${arcNum}.tar.gz" ]]
+	do
+		(( arcNum++ ))
+	done
+	arcName="server.${arcNum}.tar.gz"
+	tar --exclude="${LOGDIR}" --exclude="${WLDBK}" --exclude="${WLDSTR}" --exclude="${PLGBK}" --exclude="plugins" --exclude="${SRVBK}" -cpzvf ${SRVBK}/${arcName} ./*
+	if [[ $? ]]
+	then
+		echo "Server files archived successfully to ${SRVBK}/${arcName}"
+	else
+		echo "There was an error archiving server files to ${SRVBK}/${arcName}: please investigate in ${SRVBK}"
+	fi
+}
+
+restoreArchive(){
+	# Restore an archive from an archive directory. Takes 5 arguments, the 5th being optional
+	# $1: Directory to retrieve archives from
+	# $2: Directory to copy and unpack archive into
+	# $3: Archive name prefix
+	# $4: Archive name suffix
+	# $5: [Optional] Archive number to restore
+	[[ ${#*} -lt 4 ]] && echo "Function restoreArchive needs at least 4 arguments, ${#*} were given. Please fix your modified script code." && exit 1
+	[[ ! -d ${1} || ! -d ${2} ]] && echo "Function restoreArchive was passed an invalid directory name. Please fix your modified script code." && exit 1
+	[[ ! $(ls ${1} | grep "${3}.[0-9]\+.${4}") ]] && "The specified archives could not be found in ${1}. Check the directory to make sure archives exist. If archives are present, double check any modified script code to ensure the function restoreArchive was correctly invoked." && exit 1
+	for archive in $(ls ${1} | grep "${3}.[0-9]\+.${4}")
+	do
+		# Populate array of all archives where index number corresponds to archive number
+		arcNum=$(echo ${archive} | awk -F. '{print $2}')
+		archives[$arcNum]=${archive}
+	done
+	if $5
+	then
+		cp $1/${archives[$5]} $2
+		cd $2
+		tar xzvf ${archives[$5]}
+	else
+		cp $1/${archives[-1]} $2
+		cd $2
+		tar xzvf ${archives[-1]}
+	fi
+	if [[ $? ]]
+	then
+		echo "Archive successfully restored to ${2}"
+	else
+		echo "There was an error restoring the archive to ${2}. Are proper write permissions in place?"
+		exit 1
+	fi
+}
