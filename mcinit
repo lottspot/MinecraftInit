@@ -1,31 +1,8 @@
 #!/bin/bash
 
-#Variables needed in config so far:
-#JAVAEXEC: path to Java executable
-#MCJAR: path to server .jar file
-#TMUXEXEC: path to tmux executable
-#USER: user which server will be run as
-#SRVDIR: directory containing main server files; should point to directory containing bukkit/MC .jar file
-#SESSION: name of tmux session running server
-#LOGDIR: directory storing rolled log files
-#WLDSTR: directory storing all minecraft worlds
-#RAMDISK: path to ramdisk
-#WLDBK: backup dir for worlds
-#PLGBK: backup dir for plugins
-#SRVBK: backup dir for main server files
-#LOGARCMAX: Maximum number of log archives to be retained at a given time
-#SRVARCMAX: " for server file archives
-#WLDARCMAX: " for world storage archives
-#PLGARCMAX: " for plugin archives
-#WARN_ON_RAM_CLEAR: Shows warning prompt before running ram clear operation
+#TODO: On server start (probably in the start method), check that world selected in server.properties exists in either regular world location or in WLDSTR; create empty folders in WLDSTR if not
 
-#Script dependencies:
-#Java
-#MC Server
-#tmux
-#rsync
-
-source initconfig
+source mcinit.cfg
 SCRIPT=$(echo $0 | awk -F/ '{print $NF}')
 
 main(){
@@ -33,9 +10,12 @@ main(){
 	[[ ! -x ${JAVAEXEC} ]] && echo "Cannot find java executable. Please install java or enter the path to your java executable in the init script config file." && exit 1
 	[[ ! -f ${MCJAR} ]] && echo "Cannot find minecraft .jar file. Please enter the correvt path to your .jar file in the init script config file." && exit 1
 	[[ ! -x ${TMUXEXEC} ]] && echo "Cannot find tmux executable. Please install tmux or enter the path to your tmux executable in the init script config file." && exit 1
+	[[ ! -x ${RSYNCEXEC} ]] && echo "Cannot find rsync executable. Please install rsync or enter the path to your rsync executable in the init script config file." && exit 1
 	# Run script as unpriveliged user, execute script from server directory
 	[[ ! $(cat /etc/passwd | egrep \(^${USER}:x:\)) ]] && echo "Cannot run server as ${USER}; user does not exist" && exit 1
+	if ${USER}; then
 	[[ $(whoami) != ${USER} ]] && echo "Executing as ${USER}..." && su ${USER}
+	fi
 	cd ${SRVDIR}
 	case $1 in
 		start)
@@ -119,7 +99,7 @@ main(){
 					arcPrefix[${WLDBK}]='worlds'
 					;;
 				*)
-					echo "Usage: ${SCRIPT} archive [logs|worlds|plugins|server|all]"
+					echo "Usage: ${SCRIPT} archive logs|worlds|plugins|server|all"
 					exit 0
 					;;
 			esac
@@ -170,7 +150,7 @@ main(){
 					rstrDir[${WLDBK}]=${SRVDIR}
 					;;
 				*)
-					echo "Usage: ${SCRIPT} restore [logs|worlds|plugins|server|all] <archive number>"
+					echo "Usage: ${SCRIPT} restore logs|worlds|plugins|server|all [<archive number>]"
 					exit 0
 					;;
 			esac
@@ -230,7 +210,7 @@ main(){
 					done
 					;;
 				*)
-					echo "Usage: ${SCRIPT} ram [on|off|clear] <world names>"
+					echo "Usage: ${SCRIPT} ram on|off|clear <world names>"
 					exit 0
 					;;
 			esac
@@ -244,7 +224,7 @@ main(){
 				tmux send -t ${SESSION} "$2" ENTER
 				echo "Executed server command ${2}. Run ${SCRIPT} logtail to check output."
 			else
-				echo
+				echo "Usage: exec <mc server command>"
 			fi
 			;;
 		logtail)
@@ -264,11 +244,25 @@ main(){
 			fi
 			tmux attach -t ${SESSION}
 			;;
+		*|help)
+			echo 'Usage:
+			start|stop|restart|status
+			archive logs|worlds|plugins|server|all
+			restore logs|worlds|plugins|server|all
+			ram on|off|clear <world names>
+			to-disk
+			exec <mc server command>
+			logtail [<num lines>]
+			console'
+			;;
 	esac
 }
 
 isRunning(){
-	# Check for running server instance; return value of true if running, false if not.
+	#################################################
+	# Check for running server instance; 
+	# Return value of true if running, false if not.
+	#################################################
 	if ps a | grep -v grep | grep "${INVOCATION}" > /dev/null
 	then
 		return 0
@@ -278,6 +272,9 @@ isRunning(){
 }
 
 runServer(){
+	##############################################
+	# Initiate an instance of the minecraft server
+	##############################################
 	# Initiate server in tmux session
 	tmux new-session -s ${SESSION} "${INVOCATION}"
 	echo -n "Starting minecraft..."
@@ -307,6 +304,9 @@ runServer(){
 }
 
 haltServer(){
+	####################################################
+	# Stop the running instance of the minecraft server
+	####################################################
 	# Send save-all and stop commands to console for graceful shutdown
 	echo "Saving worlds..."
 	tmux send -t ${SESSION} "save-all" ENTER
@@ -346,6 +346,10 @@ haltServer(){
 }
 
 logRoll(){
+	##################################################################
+	# Flushes the server logfile into a log retention directory
+	# Log entries flushed on the same day are appended to the same file
+	###################################################################
 	# Check for log dir, create if does not exist
 	[[ ! -d ${LOGDIR} ]] && mkdir ${LOGDIR}
 	rollName="rolled.$(date +%d-%b-%Y).log"
@@ -362,6 +366,10 @@ logRoll(){
 }
 
 archiveLogs(){
+	##################################################
+	# Archives all logs in the log retention directory
+	# Purges log files after archiving
+	##################################################
 	fileNum=0
 	tarName="logs.${fileNum}.tar.gz"
 	# Find first available filename
@@ -393,10 +401,14 @@ archiveLogs(){
 }
 
 archiveRoll(){
-	# Find oldest archive, delete it, and rename remaning archives accordingly. Takes 3 arguments
+	#########################################################################
+	# Find oldest archive, delete it;
+	# rename remaning archives accordingly. 
+	# Takes 3 arguments:
 	# $1: Archive file prefix [Cannot contain a '.' or numeric characters]
 	# $2: Archive file suffix [Cannot contain numeric characters]
 	# $3: Archive file directory
+	#########################################################################
 	cd ${3}
 	rmFile=$(ls | grep "$1\.0\.$2")
 	if [[ ${rmFile} ]]
@@ -424,7 +436,10 @@ archiveRoll(){
 }
 
 getWorlds(){
-	# Get all worlds and ramdisk information; store in an associative array
+	#########################################
+	# Get all worlds and ramdisk information; 
+	# store in an associative array
+	#########################################
 	declare -A worldInRam
 	for wld in $(ls ${WLDSTR})
 	do
@@ -441,17 +456,23 @@ getWorlds(){
 }
 
 ramdiskOn(){
+	###################
 	# Add ramdisk flag
+	###################
 	[[ ! -e ${WLDSTR}/$1/ramdisk ]] && echo "This file is a flag marking this world as needing to be loaded in  RAM. Its contents are entirely meangingless." > ${WLDSTR}/$1/ramdisk
 }
 
 ramdiskOff(){
+	#####################
 	# Remove ramdisk flag
+	#####################
 	[[ -e ${WLDSTR}/$1/ramdisk ]] && rm ${WLDSTR}/$1/ramdisk
 }
 
 toRam(){
+	#################################
 	# Copy all ramdisk worlds to RAM
+	#################################
 	[[ isRunning ]] && tmux send -t ${SESSION} "save-all" ENTER
 	getWorlds
 	for wld in ${!worldInRam[*]}
@@ -477,6 +498,10 @@ toRam(){
 }
 
 cleanRam(){
+	############################################
+	# Clear any existing worlds from the ramdisk
+	# DOES NOT SAVE WORLDS
+	############################################
 	getWorlds
 	for wld in ${!worldInRam[*]}
 	do
@@ -488,7 +513,9 @@ cleanRam(){
 }
 
 toDisk(){
+	###########################################
 	# Copy all worlds in RAM back to hard disk
+	###########################################
 	[[ isRunning ]] && tmux send -t ${SESSION} "save-all" ENTER
 	getWorlds
 	for wld in ${!worldInRam[*]}
@@ -501,6 +528,11 @@ toDisk(){
 }
 
 checkLinks(){
+	###############################################################
+	# Checks all symlinks to ensure they link to proper locations
+	# Linking to RAM when world is present in ramdisk
+	# Linking to world storage when present only on disk
+	###############################################################
 	# Abort link checks if server is already running
 	[[ isRunning ]] && echo "Cannot change world links while server is running. Please stop server and retry operation." && exit 1
 	getWorlds
@@ -541,6 +573,10 @@ checkLinks(){
 }
 
 archiveWorlds(){
+	#####################################################################
+	# Archives world storage directory
+	# Moves archive to a world backup directory (${WLDBK} directory)
+	#####################################################################
 	arcNum=0
 	[[ ! -d ${WLDSTR} ]] && echo "Cannot archive worlds: ${WLDSTR} either does not exist or isn't a directory" && exit 1
 	if [[ ! -d ${WLDBK} ]]
@@ -566,6 +602,10 @@ archiveWorlds(){
 }
 
 archivePlugins(){
+	####################################################################
+	# Archives plugins directory
+	# Moves archive into a plugins backup directory (${PLGBK} directory)
+	####################################################################
 	arcNum=0
 	if [[ ! -d ${PLGBK} ]]
 	then 
@@ -589,6 +629,10 @@ archivePlugins(){
 }
 
 archiveServer(){
+	################################################################################
+	# Archives all server files which are not related to worlds, plugins, or backups
+	# Moves archive into a server backup directory (${SRVBK} directory)
+	################################################################################
 	arcNum=0
 	if [[ ! -d ${SRVBK} ]]
 	then 
@@ -612,12 +656,15 @@ archiveServer(){
 }
 
 restoreArchive(){
-	# Restore an archive from an archive directory. Takes 5 arguments, the 5th being optional
+	################################################
+	# Restore an archive from an archive directory. 
+	# Takes 5 arguments, the 5th being optional
 	# $1: Directory to retrieve archives from
 	# $2: Directory to copy and unpack archive into
 	# $3: Archive name prefix
 	# $4: Archive name suffix
 	# $5: [Optional] Archive number to restore
+	################################################
 	[[ ${#*} -lt 4 ]] && echo "Function restoreArchive needs at least 4 arguments, ${#*} were given. Please fix your modified script code." && exit 1
 	[[ ! -d ${1} || ! -d ${2} ]] && echo "Function restoreArchive was passed an invalid directory name. Please fix your modified script code." && exit 1
 	[[ ! $(ls ${1} | grep "${3}.[0-9]\+.${4}") ]] && "The specified archives could not be found in ${1}. Check the directory to make sure archives exist. If archives are present, double check any modified script code to ensure the function restoreArchive was correctly invoked." && exit 1
@@ -645,3 +692,5 @@ restoreArchive(){
 		exit 1
 	fi
 }
+
+main $*
