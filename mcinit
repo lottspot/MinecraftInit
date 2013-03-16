@@ -7,13 +7,16 @@ SCRIPT=$(echo $0 | awk -F/ '{print $NF}')
 
 main(){
 	# Check script dependencies
+	bashMajor=$(bash --version | head -n 1 | awk '{print $4}' | awk -F. '{ print $1}')
+	bashMinor=$(bash --version | head -n 1 | awk '{print $4}' | awk -F. '{ print $2}')
+	[[ ${bashMajor} -lt 4 && ${bashMinor} -lt 2 || ${bashMajor} -lt 4 ]] && echo "This script is only compatible with bash 4.2 or higher. Your bash version is ${bashMajor}.${bashMinor}" && exit 1
 	[[ ! -x ${JAVAEXEC} ]] && echo "Cannot find java executable. Please install java or enter the path to your java executable in the init script config file." && exit 1
 	[[ ! -f ${MCJAR} ]] && echo "Cannot find minecraft .jar file. Please enter the correvt path to your .jar file in the init script config file." && exit 1
 	[[ ! -x ${TMUXEXEC} ]] && echo "Cannot find tmux executable. Please install tmux or enter the path to your tmux executable in the init script config file." && exit 1
 	[[ ! -x ${RSYNCEXEC} ]] && echo "Cannot find rsync executable. Please install rsync or enter the path to your rsync executable in the init script config file." && exit 1
 	# Run script as unpriveliged user, execute script from server directory
 	[[ ! $(cat /etc/passwd | egrep \(^${USER}:x:\)) ]] && echo "Cannot run server as ${USER}; user does not exist" && exit 1
-	if ${USER}; then
+	if cat /etc/passwd | grep ${USER} > /dev/null; then
 	[[ $(whoami) != ${USER} ]] && echo "Executing as ${USER}..." && su ${USER}
 	fi
 	cd ${SRVDIR}
@@ -21,7 +24,7 @@ main(){
 		start)
 			if isRunning
 			then
-				echo "Server is already running."
+				echo "Minecraft is already running."
 				exit 0
 			else
 				toRam
@@ -32,11 +35,17 @@ main(){
 		stop)
 			if isRunning
 			then
-				toDisk
+				getWorlds
+				inRam=false
+				for wld in ${worldInRam[*]}
+				do
+					[[ ${wld} == true ]] && inRam=true
+				done
+				[[ ${inRam} == true ]] && toDisk
 				haltServer
 				cleanRam
 			else
-				echo "Server is already stopped."
+				echo "Minecraft is already stopped."
 			fi
 			;;
 		restart)
@@ -47,15 +56,15 @@ main(){
 				checkLinks
 				runServer
 			else
-				echo "Cannot restart: server is stopped"
+				echo "Cannot restart: minecraft is stopped"
 			fi
 			;;
 		status)
 			if isRunning
 			then
-				echo "Server is running"
+				echo "Minecraft is running"
 			else
-				echo "Server is not running"
+				echo "Minecraft is not running"
 			fi
 			;;
 		roll-log)
@@ -108,11 +117,12 @@ main(){
 				if [[ ${arcMax[$dir]} -gt 0 ]]
 				then
 					arcs=($(ls ${dir}))
-					while [[ ${#arcs} -gt ${arcMax[$dir]} ]]
+					while [[ ${#arcs[*]} -gt ${arcMax[$dir]} ]]
 					do
-						delRemain=$(expr ${#arcs} - ${arcMax[$dir]})
+						delRemain=$(expr ${#arcs[*]} - ${arcMax[$dir]})
 						echo "Purging ${delRemain} old archive(s) from ${dir}..."
-						archiveRoll ${arcPre[$dir]} 'tar.gz' ${dir}
+						archiveRoll ${arcPrefix[$dir]} 'tar.gz' ${dir}
+						#TODO: Write a function to let the user know that the newly created archive has been rolled over to its new name (e.g., if message echos saying "successfully archived to worlds.10.tar.gz, then worlds.10 is immediately rolled to worlds.9, that's confusing).
 						arcs=($(ls ${dir}))
 					done
 				fi
@@ -127,7 +137,9 @@ main(){
 					;;
 				worlds)
 					arcPfx[${WLDBK}]='worlds'
-					dir=$(echo ${WLDSTR} | awk -F/ '{$NF=""; OFS=/; print}')
+					# TODO: FIX THIS BUG. If the string is only one field long, this will pass a blank directory name!
+					# could fix at arg passing time
+					dir=$(echo ${WLDSTR} | awk -F/ '{$NF=""; OFS="/"; print}')
 					rstrDir[${WLDBK}]=${dir}
 					;;
 				plugins)
@@ -156,37 +168,62 @@ main(){
 			esac
 			for dir in ${!arcPfx[*]}
 			do
+				[[ ! ${rstrDir[$dir]} ]] && rstrDir[$dir]='.'
 				restoreArchive ${dir} ${rstrDir[$dir]} ${arcPfx[$dir]} 'tar.gz' $3
 			done
 			;;
 		ram)
 			wlds=($(echo $* | awk '{$1=""; $2=""; print}'))
 			i=0
-			while [[ ${i} -lt ${#wlds} ]]
+			while [[ ${i} -lt ${#wlds[*]} ]]
 			do
 				[[ ! -d ${WLDSTR}/${wlds[$i]} ]] && echo "${wlds[$i]} does not exist in ${WLDSTR}. No operation will be performed for this world." && wlds[$i]=''
 				(( i++ ))
 			done
-			[[ ! ${wlds[*]} ]] && exit 0
 			case $2 in
 				on)
+					[[ ! ${wlds[*]} ]] && echo "No valid worlds selected for operation." && exit 0
 					for wld in ${wlds[*]}
 					do
 						ramdiskOn ${wld}
 					done
 					;;
 				off)
+					[[ ! ${wlds[*]} ]] && echo "No valid worlds selected for operation." && exit 0
 					for wld in ${wlds[*]}
 					do
 						ramdiskOff ${wld}
 					done
 					;;
+				ls)
+					inRam
+					[[ ${#ramWorlds[*]} -lt 1 ]] && echo "No worlds present in ramdisk." && exit 0
+					for wld in ${ramWorlds[*]}
+					do
+						echo "${wld}"
+					done
+					;;
+				enabled)
+					getWorlds
+					for wld in ${!worldInRam[*]}
+					do
+						[[ ${worldInRam[$wld]} == true ]] && echo ${wld}
+					done
+					;;
+				disabled)
+					getWorlds
+					for wld in ${!worldInRam[*]}
+					do
+						[[ ! ${worldInRam[$wld]} == true ]] && echo ${wld}
+					done
+					;;
 				clear)
-					if [[ ${WARN_ON_RAM_CLEAR} ]] 
+					[[ ! ${wlds[*]} ]] && echo "No valid worlds selected for operation." && exit 0
+					if ${WARN_ON_RAM_CLEAR}
 						then
 							echo -n "WARNING: This operation does NOT copy to disk before clearing worlds from RAM. Any changes made to worlds since last to-disk operation was run will be lost. Still proceed? (Y/n) "
 							read cont
-							[[ ${cont} != 'Y' ]] && echo "Aborting operation." && exit 0
+							[[ ${cont} != 'Y' ]] && echo "Y not selected: aborting..." && exit 0
 						fi
 					declare -A xstat
 					for wld in ${wlds[*]}
@@ -201,7 +238,7 @@ main(){
 					done
 					for wld in ${!xstat[*]}
 					do
-						if ${xstat[$wld]}
+						if [[ ${xstat[$wld]} ]]
 						then
 							echo "World ${wld} successfully cleared from RAM"
 						else
@@ -210,7 +247,9 @@ main(){
 					done
 					;;
 				*)
-					echo "Usage: ${SCRIPT} ram on|off|clear <world names>"
+					echo "Usage: 
+	${SCRIPT} ram on|off|clear <world names>
+	${SCRIPT} ram ls|enabled|disabled"
 					exit 0
 					;;
 			esac
@@ -219,6 +258,7 @@ main(){
 			toDisk
 			;;
 		exec)
+			[[ ! $(isRunning) ]] && echo "Cannot execute command: Server is not running." && exit 0
 			if $2
 			then
 				tmux send -t ${SESSION} "$2" ENTER
@@ -240,20 +280,22 @@ main(){
 			then
 				echo -n "You are about to attach to your minecraft console inside of a tmux session. In order to detach without stopping the server, you will need to enter the tmux command key (default: Ctrl + b) followed by the detatch key (default: d). Continue? (Y/n): "
 				read response
-				[[ ${response} != Y ]] && echo "Aborting..." && exit 0
+				[[ ${response} != Y ]] && echo "Y not selected: aborting..." && exit 0
 			fi
 			tmux attach -t ${SESSION}
 			;;
 		*|help)
 			echo 'Usage:
-			start|stop|restart|status
-			archive logs|worlds|plugins|server|all
-			restore logs|worlds|plugins|server|all
-			ram on|off|clear <world names>
-			to-disk
-			exec <mc server command>
-			logtail [<num lines>]
-			console'
+	start|stop|restart|status
+	roll-log
+	archive logs|worlds|plugins|server|all
+	restore logs|worlds|plugins|server|all [<archive number>]
+	ram on|off|clear <world names>
+	ram ls|enabled|disabled
+	to-disk
+	exec <mc server command>
+	logtail [<num lines>]
+	console'
 			;;
 	esac
 }
@@ -276,15 +318,12 @@ runServer(){
 	# Initiate an instance of the minecraft server
 	##############################################
 	# Initiate server in tmux session
-	tmux new-session -s ${SESSION} "${INVOCATION}"
+	tmux new-session -ds ${SESSION} "${INVOCATION}"
 	echo -n "Starting minecraft..."
 	# 'cycle' variable tracks how many loops have been executed while waiting for the server to start
 	cycle=0
 	# Initiate loop which continues until both tmux and java are confirmed to be running
-	until [[ \
-		$(tmux list-sessions | egrep ${SESSION}:\ \[0-9\]+ > /dev/null) && \
-		$(ps a | grep -v grep | grep "${INVOCATION}" > /dev/null) \
-	]]
+	until isRunning
 	do
 		sleep 3
 		# Creates a nice animation while waiting for server start
@@ -292,7 +331,7 @@ runServer(){
 		# Fail out after 10 cycles (30 seconds) with error message
 		if [[ ${cycle} -ge 10 ]]
 		then
-			echo "Sever start failed with the following errors:"
+			echo " Sever start failed with the following errors:"
 			[[ ! $(tmux list-sessions | egrep ${SESSION}:\ \[0-9\]+ > /dev/null) ]] && echo "Tmux session did not start."
 			[[ ! $(ps a | grep -v grep | grep "${INVOCATION}" > /dev/null) ]] && echo "Java was unable to start."
 			echo "Call in your sysadmin for backup."
@@ -300,7 +339,7 @@ runServer(){
 		fi
 		(( cycle++ ))
 	done
-	echo "Server started successfully. Attach to console using: ${SCRIPT} attach"
+	echo " Server started successfully. Attach to console using: ${SCRIPT} console"
 }
 
 haltServer(){
@@ -315,10 +354,7 @@ haltServer(){
 	echo -n "Stopping minecraft..."
 	cycle=0
 	# Wait for server to shut down
-	until [[ \
-		! $(tmux list-sessions | egrep ${SESSION}:\ \[0-9\]+ > /dev/null) && \
-		! $(ps a | grep -v grep | grep "${INVOCATION}" > /dev/null) \
-	]]
+	until [[ ! $(isRunning) ]]
 	do
 		# Add nice animation while waiting for server shutdown
 		sleep 3
@@ -326,23 +362,19 @@ haltServer(){
 		# Fail out with error messages if server is not stopped after 20 cycles (60 seconds)
 		if [[ ${cycle} -ge 20 ]]
 		then
-			echo "Sever did not cleanly stop after 60 seconds; you may need to perform the following."
-			if [[ $(ps a | grep -v grep | grep "${INVOCATION}" > /dev/null) ]]
-			then
-				PID=$(ps a | grep -v grep | grep "${INVOCATION}" | awk '{print $1}')
-				echo "Kill Java:"
-				echo "[ kill ${PID} | kill -9 ${PID} ]"
-			else
-				echo "Kill tmux session:"
-				echo "tmux kill-session -t ${SESSION}"
-			fi
+			echo " Sever did not cleanly stop after 60 seconds; you may need to kill java using one of the following commands:"
+			PID=$(ps a | grep -v grep | grep "${INVOCATION}" | awk '{print $1}')
+			echo "kill ${PID}"
+			echo "kill -9 ${PID}"
+			echo
 			echo "Or call in your sysadmin for backup."
 			exit 1
 		fi
 		(( cycle++ ))
 	done
+	[[ $(tmux list-sessions | grep ${SESSION}) ]] && tmux kill-session -t ${SESSION}
 	# Success message
-	echo "Server cleanly shut down."
+	echo " Server cleanly shut down."
 }
 
 logRoll(){
@@ -436,11 +468,13 @@ archiveRoll(){
 }
 
 getWorlds(){
+	#TODO: This function is not exporting its array. This makes it entirely useless.
+	#BUG: The problem appears to be with taking an associative array declared or populated inside of a function and accessing it outside of the function.
 	#########################################
 	# Get all worlds and ramdisk information; 
 	# store in an associative array
 	#########################################
-	declare -A worldInRam
+	declare -gA worldInRam
 	for wld in $(ls ${WLDSTR})
 	do
 		if [[ -d ${WLDSTR}/${wld} ]]
@@ -473,7 +507,7 @@ toRam(){
 	#################################
 	# Copy all ramdisk worlds to RAM
 	#################################
-	[[ isRunning ]] && tmux send -t ${SESSION} "save-all" ENTER
+	[[ $(isRunning) ]] && tmux send -t ${SESSION} "save-all" ENTER
 	getWorlds
 	for wld in ${!worldInRam[*]}
 	do
@@ -482,7 +516,7 @@ toRam(){
 			if [[ ! -d ${RAMDISK}/${wld} ]]
 			then
 				echo "Copying ${wld} to Ram..."
-				rsync -r ${WLDSTR}/${wld} ${RAMDISK}/${wld}
+				rsync -rv ${WLDSTR}/${wld}/ ${RAMDISK}/${wld}
 				if [[ $? ]]
 				then
 					echo "${wld} copied."
@@ -512,19 +546,32 @@ cleanRam(){
 	done
 }
 
+inRam(){
+	getWorlds
+	ramWorlds=()
+	for wld in ${!worldInRam[*]}
+	do
+		[[ -d ${RAMDISK}/${wld} ]] && ramWorlds[${#ramWorlds[*]}]=${wld}
+	done
+}
+
 toDisk(){
 	###########################################
 	# Copy all worlds in RAM back to hard disk
 	###########################################
-	[[ isRunning ]] && tmux send -t ${SESSION} "save-all" ENTER
+	[[ $(isRunning) ]] && tmux send -t ${SESSION} "save-all" ENTER
 	getWorlds
+	noWorlds=true
 	for wld in ${!worldInRam[*]}
 	do
 		if [[ -d ${RAMDISK}/${wld} ]]
 		then
-			rsync -rv ${RAMDISK}/${wld} ${WLDSTR}/${wld}
+			noWorlds=false
+			echo "Copying ${wld} to hard disk..."
+			rsync -rv ${RAMDISK}/${wld}/ ${WLDSTR}/${wld}
 		fi
 	done
+	[[ ${noWorlds} == true ]] && echo "No worlds present in ramdisk to copy back to hard disk"
 }
 
 checkLinks(){
@@ -534,7 +581,7 @@ checkLinks(){
 	# Linking to world storage when present only on disk
 	###############################################################
 	# Abort link checks if server is already running
-	[[ isRunning ]] && echo "Cannot change world links while server is running. Please stop server and retry operation." && exit 1
+	[[ $(isRunning) ]] && echo "Cannot change world links while server is running. Please stop server and retry operation." && exit 1
 	getWorlds
 	for wld in ${!worldInRam[*]}
 	do
@@ -551,7 +598,10 @@ checkLinks(){
 				then
 					[[ ${link} != ${RAMDISK}/${wld} ]] && ln -sf ${RAMDISK}/${wld} ${wld}
 				else
-					[[ ${link} != $(cd ${WLDSTR}; pwd) ]] && ln -sf $(cd ${WLDSTR}; pwd) ${wld}
+					cd ${WLDSTR}
+					wldStrPath=$(pwd)
+					cd - > /dev/null
+					[[ ${link} != ${wldStrPath}/${wld} ]] && ln -sf ${wldStrPath}/${wld}
 				fi
 				echo "Links OK for ${wld}"
 			# If file already exists in server directory by name of symlink, raise error message and exit
@@ -618,7 +668,7 @@ archivePlugins(){
 	do
 		(( arcNum++ ))
 	done
-	arcName="worlds.${arcNum}.tar.gz"
+	arcName="plugins.${arcNum}.tar.gz"
 	tar cpzvf ${PLGBK}/${arcName} plugins
 	if [[ $? ]]
 	then
@@ -641,7 +691,7 @@ archiveServer(){
 		[[ ! $? ]] && echo "Failed to create ${SRVBK}. Please create this directory and try again." && exit 1
 		echo "Created ${SRVBK} successfully"
 	fi
-	while [[ -f "${SRVBK}/plugins.${arcNum}.tar.gz" ]]
+	while [[ -f "${SRVBK}/server.${arcNum}.tar.gz" ]]
 	do
 		(( arcNum++ ))
 	done
@@ -674,17 +724,21 @@ restoreArchive(){
 		arcNum=$(echo ${archive} | awk -F. '{print $2}')
 		archives[$arcNum]=${archive}
 	done
-	if $5
+	if [[ $5 ]]
 	then
 		cp $1/${archives[$5]} $2
 		cd $2
 		tar xzvf ${archives[$5]}
+		xstat=$?
+		rm ${archives[$5]}
 	else
 		cp $1/${archives[-1]} $2
 		cd $2
 		tar xzvf ${archives[-1]}
+		xstat=$?
+		rm ${archives[-1]}
 	fi
-	if [[ $? ]]
+	if [[ $xstat ]]
 	then
 		echo "Archive successfully restored to ${2}"
 	else
