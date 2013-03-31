@@ -3,6 +3,7 @@
 #TODO: On server start (probably in the start method), check that world selected in server.properties exists in either regular world location or in WLDSTR; create empty folders in WLDSTR if not
 
 source mcinit.cfg
+declare -A worldInRam
 SCRIPT=$(echo $0 | awk -F/ '{print $NF}')
 
 main(){
@@ -258,8 +259,8 @@ main(){
 			toDisk
 			;;
 		exec)
-			[[ ! $(isRunning) ]] && echo "Cannot execute command: Server is not running." && exit 0
-			if $2
+			[[ $(isRunning) ]] && echo "Cannot execute command: Server is not running." && exit 0
+			if [[ $2 ]]
 			then
 				tmux send -t ${SESSION} "$2" ENTER
 				echo "Executed server command ${2}. Run ${SCRIPT} logtail to check output."
@@ -474,7 +475,6 @@ getWorlds(){
 	# Get all worlds and ramdisk information; 
 	# store in an associative array
 	#########################################
-	declare -gA worldInRam
 	for wld in $(ls ${WLDSTR})
 	do
 		if [[ -d ${WLDSTR}/${wld} ]]
