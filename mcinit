@@ -1,10 +1,11 @@
 #!/bin/bash
 
 #TODO: On server start (probably in the start method), check that world selected in server.properties exists in either regular world location or in WLDSTR; create empty folders in WLDSTR if not
-
-source mcinit.cfg
-declare -A worldInRam
+CONFIG_FILE='mcinit.cfg'
 SCRIPT=$(echo $0 | awk -F/ '{print $NF}')
+
+source $CONFIG_FILE
+declare -A worldInRam
 
 main(){
 	# Check script dependencies
@@ -15,11 +16,6 @@ main(){
 	[[ ! -f ${MCJAR} ]] && echo "Cannot find minecraft .jar file. Please enter the correvt path to your .jar file in the init script config file." && exit 1
 	[[ ! -x ${TMUXEXEC} ]] && echo "Cannot find tmux executable. Please install tmux or enter the path to your tmux executable in the init script config file." && exit 1
 	[[ ! -x ${RSYNCEXEC} ]] && echo "Cannot find rsync executable. Please install rsync or enter the path to your rsync executable in the init script config file." && exit 1
-	# Run script as unpriveliged user, execute script from server directory
-	[[ ! $(cat /etc/passwd | egrep \(^${USER}:x:\)) ]] && echo "Cannot run server as ${USER}; user does not exist" && exit 1
-	if cat /etc/passwd | grep ${USER} > /dev/null; then
-	[[ $(whoami) != ${USER} ]] && echo "Executing as ${USER}..." && su ${USER}
-	fi
 	cd ${SRVDIR}
 	case $1 in
 		start)
@@ -262,7 +258,8 @@ main(){
 			[[ $(isRunning) ]] && echo "Cannot execute command: Server is not running." && exit 0
 			if [[ $2 ]]
 			then
-				tmux send -t ${SESSION} "$2" ENTER
+				cmd="$2"
+				tmux send -t ${SESSION} "$cmd" ENTER
 				echo "Executed server command ${2}. Run ${SCRIPT} logtail to check output."
 			else
 				echo "Usage: exec <mc server command>"
@@ -747,4 +744,11 @@ restoreArchive(){
 	fi
 }
 
-main $*
+# Run script as unpriveliged user, execute script from server directory
+[[ ! $(cat /etc/passwd | egrep \(^${USER}:x:\)) ]] && echo "Cannot run server as ${USER}; user does not exist" && exit 1
+if [[ $(whoami) != ${USER} ]] 
+then
+	echo "Executing as ${USER}..." && su ${USER} -c "$0 $*"
+else
+	main $*
+fi
