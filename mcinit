@@ -2,7 +2,8 @@
 
 #TODO: On server start (probably in the start method), check that world selected in server.properties exists in either regular world location or in WLDSTR; create empty folders in WLDSTR if not
 CONFIG_FILE='mcinit.cfg'
-SCRIPT=$(echo $0 | awk -F/ '{print $NF}')
+SCRIPT=$(basename $0)
+PID=''
 
 source $CONFIG_FILE
 declare -A worldInRam
@@ -11,11 +12,11 @@ main(){
 	# Check script dependencies
 	bashMajor=$(bash --version | head -n 1 | awk '{print $4}' | awk -F. '{ print $1}')
 	bashMinor=$(bash --version | head -n 1 | awk '{print $4}' | awk -F. '{ print $2}')
-	[[ ${bashMajor} -lt 4 && ${bashMinor} -lt 2 || ${bashMajor} -lt 4 ]] && echo "This script is only compatible with bash 4.2 or higher. Your bash version is ${bashMajor}.${bashMinor}" && exit 1
-	[[ ! -x ${JAVAEXEC} ]] && echo "Cannot find java executable. Please install java or enter the path to your java executable in the init script config file." && exit 1
-	[[ ! -f ${MCJAR} ]] && echo "Cannot find minecraft .jar file. Please enter the correvt path to your .jar file in the init script config file." && exit 1
-	[[ ! -x ${TMUXEXEC} ]] && echo "Cannot find tmux executable. Please install tmux or enter the path to your tmux executable in the init script config file." && exit 1
-	[[ ! -x ${RSYNCEXEC} ]] && echo "Cannot find rsync executable. Please install rsync or enter the path to your rsync executable in the init script config file." && exit 1
+	[[ ( ${bashMajor} -lt 4 && ${bashMinor} -lt 2 ) || ${bashMajor} -lt 4 ]] && echo "This script is only compatible with bash 4.2 or higher. Your bash version is ${bashMajor}.${bashMinor}" >&2 && exit 1
+	[[ ! -x ${JAVAEXEC} ]] && echo "Cannot find java executable. Please install java or enter the path to your java executable in the init script config file." >&2 && exit 1
+	[[ ! -f ${MCJAR} ]] && echo "Cannot find minecraft .jar file. Please enter the correvt path to your .jar file in the init script config file." >&2 && exit 1
+	[[ ! -x ${TMUXEXEC} ]] && echo "Cannot find tmux executable. Please install tmux or enter the path to your tmux executable in the init script config file." >&2 && exit 1
+	[[ ! -x ${RSYNCEXEC} ]] && echo "Cannot find rsync executable. Please install rsync or enter the path to your rsync executable in the init script config file." >&2 && exit 1
 	cd ${SRVDIR}
 	case $1 in
 		start)
@@ -32,13 +33,14 @@ main(){
 		stop)
 			if isRunning
 			then
+				echoModeChange SHUTDOWN 10
 				getWorlds
 				inRam=false
 				for wld in ${worldInRam[*]}
 				do
-					[[ ${wld} == true ]] && inRam=true
+					${wld} && inRam=true
 				done
-				[[ ${inRam} == true ]] && toDisk
+				${inRam} && toDisk
 				haltServer
 				cleanRam
 			else
@@ -48,6 +50,7 @@ main(){
 		restart)
 			if isRunning
 			then
+				echoModeChange RESTART 10
 				toDisk
 				haltServer
 				checkLinks
@@ -255,12 +258,14 @@ main(){
 			toDisk
 			;;
 		exec)
-			[[ $(isRunning) ]] && echo "Cannot execute command: Server is not running." && exit 0
+			isRunning || ( echo "Cannot execute command: Server is not running." && exit 0 )
 			if [[ $2 ]]
 			then
-				cmd="$2"
-				tmux send -t ${SESSION} "$cmd" ENTER
-				echo "Executed server command ${2}. Run ${SCRIPT} logtail to check output."
+				# Shift statement shifts argument array to the left (much like perl) remaining args can then be passed
+				shift
+				tmux send -t ${SESSION} "$*" ENTER
+				sleep 0.25
+				tail server.log
 			else
 				echo "Usage: exec <mc server command>"
 			fi
@@ -303,8 +308,13 @@ isRunning(){
 	# Check for running server instance; 
 	# Return value of true if running, false if not.
 	#################################################
-	if ps a | grep -v grep | grep "${INVOCATION}" > /dev/null
+	port=$(cat server.properties | grep server-port | cut -d= -f2)
+	test $? -ne 0 && echo "CRITICAL ERROR: Server has no port configured. Please configure the parameter server-port in server.properties" && exit 2
+	 
+	if netstat -nlp 2>/dev/null | egrep ":${port}\b" > /dev/null 2>&1
 	then
+		PID=$(netstat -nlp 2>/dev/null | egrep ":${port}\b" | awk '{print $7}' | cut -d/ -f1)
+		test -f ${RUNDIR}/${PID} && SESSION=$(cat ${RUNDIR}/${PID} 2> /dev/null)
 		return 0
 	else
 		return 1
@@ -316,6 +326,7 @@ runServer(){
 	# Initiate an instance of the minecraft server
 	##############################################
 	# Initiate server in tmux session
+	findSessionName
 	tmux new-session -ds ${SESSION} "${INVOCATION}"
 	echo -n "Starting minecraft..."
 	# 'cycle' variable tracks how many loops have been executed while waiting for the server to start
@@ -333,11 +344,13 @@ runServer(){
 			[[ ! $(tmux list-sessions | egrep ${SESSION}:\ \[0-9\]+ > /dev/null) ]] && echo "Tmux session did not start."
 			[[ ! $(ps a | grep -v grep | grep "${INVOCATION}" > /dev/null) ]] && echo "Java was unable to start."
 			echo "Call in your sysadmin for backup."
-			exit 1
+			return 1
 		fi
 		(( cycle++ ))
 	done
+	echo "${SESSION}" > ${RUNDIR}/${PID} 2>/dev/null
 	echo " Server started successfully. Attach to console using: ${SCRIPT} console"
+	return 0
 }
 
 haltServer(){
@@ -352,7 +365,7 @@ haltServer(){
 	echo -n "Stopping minecraft..."
 	cycle=0
 	# Wait for server to shut down
-	until [[ ! $(isRunning) ]]
+	until ! isRunning
 	do
 		# Add nice animation while waiting for server shutdown
 		sleep 3
@@ -361,7 +374,6 @@ haltServer(){
 		if [[ ${cycle} -ge 20 ]]
 		then
 			echo " Sever did not cleanly stop after 60 seconds; you may need to kill java using one of the following commands:"
-			PID=$(ps a | grep -v grep | grep "${INVOCATION}" | awk '{print $1}')
 			echo "kill ${PID}"
 			echo "kill -9 ${PID}"
 			echo
@@ -381,7 +393,7 @@ logRoll(){
 	# Log entries flushed on the same day are appended to the same file
 	###################################################################
 	# Check for log dir, create if does not exist
-	[[ ! -d ${LOGDIR} ]] && mkdir ${LOGDIR}
+	( [[ ! -d ${LOGDIR} ]] && mkdir -p ${LOGDIR} ) || ( echo "Could not create ${LOGDIR}. Log-roll aborted" && return 1 )
 	rollName="rolled.$(date +%d-%b-%Y).log"
 	# Create one rolled log per day; if logs rolled multiple times per day, append contents to same file
 	cat server.log >> ${LOGDIR}/${rollName}
@@ -400,6 +412,7 @@ archiveLogs(){
 	# Archives all logs in the log retention directory
 	# Purges log files after archiving
 	##################################################
+	( test -d ${LOGDIR} || mkdir -p ${LOGDIR} ) || ( echo "Could not create ${LOGDIR}. Log-roll aborted" && return 1 )
 	fileNum=0
 	tarName="logs.${fileNum}.tar.gz"
 	# Find first available filename
@@ -472,6 +485,7 @@ getWorlds(){
 	# Get all worlds and ramdisk information; 
 	# store in an associative array
 	#########################################
+	test -d ${WLDSTR} || return 2
 	for wld in $(ls ${WLDSTR})
 	do
 		if [[ -d ${WLDSTR}/${wld} ]]
@@ -484,12 +498,14 @@ getWorlds(){
 			fi
 		fi
 	done
+	return 0
 }
 
 ramdiskOn(){
 	###################
 	# Add ramdisk flag
 	###################
+	test -d ${WLDSTR} || return 2
 	[[ ! -e ${WLDSTR}/$1/ramdisk ]] && echo "This file is a flag marking this world as needing to be loaded in  RAM. Its contents are entirely meangingless." > ${WLDSTR}/$1/ramdisk
 }
 
@@ -497,6 +513,7 @@ ramdiskOff(){
 	#####################
 	# Remove ramdisk flag
 	#####################
+	test -d || return 2
 	[[ -e ${WLDSTR}/$1/ramdisk ]] && rm ${WLDSTR}/$1/ramdisk
 }
 
@@ -504,7 +521,8 @@ toRam(){
 	#################################
 	# Copy all ramdisk worlds to RAM
 	#################################
-	[[ $(isRunning) ]] && tmux send -t ${SESSION} "save-all" ENTER
+	( test -d ${RAMDISK} && test -d ${WLDSTR} ) || ( echo "Something went wrong. Double check your RAMDISK and WLDSTR directories" >&2 && return 2 )
+	isRunning && tmux send -t ${SESSION} "save-all" ENTER
 	getWorlds
 	for wld in ${!worldInRam[*]}
 	do
@@ -513,7 +531,7 @@ toRam(){
 			if [[ ! -d ${RAMDISK}/${wld} ]]
 			then
 				echo "Copying ${wld} to Ram..."
-				rsync -rv ${WLDSTR}/${wld}/ ${RAMDISK}/${wld}
+				rsync -rv ${WLDSTR}/${wld}/ ${RAMDISK}/${wld}/
 				if [[ $? ]]
 				then
 					echo "${wld} copied."
@@ -533,6 +551,7 @@ cleanRam(){
 	# Clear any existing worlds from the ramdisk
 	# DOES NOT SAVE WORLDS
 	############################################
+	test -d ${RAMDISK} || ( echo "Cannot clear ram. RAMDISK directory does not exist at ${RAMDISK}" && return 2 )
 	getWorlds
 	for wld in ${!worldInRam[*]}
 	do
@@ -544,6 +563,7 @@ cleanRam(){
 }
 
 inRam(){
+	test -d ${RAMDISK} || return 2
 	getWorlds
 	ramWorlds=()
 	for wld in ${!worldInRam[*]}
@@ -556,7 +576,9 @@ toDisk(){
 	###########################################
 	# Copy all worlds in RAM back to hard disk
 	###########################################
-	[[ $(isRunning) ]] && tmux send -t ${SESSION} "save-all" ENTER
+	test -d ${RAMDISK} || ( echo "Cannot move ramdisk worlds to hard disk. RAMDISK does not exist at ${RAMDISK}" && return 2 )
+	( test -d ${WLDSTR} || mkdir -p ${WLDSTR} ) || return 2
+	isRunning && tmux send -t ${SESSION} "save-all" ENTER
 	getWorlds
 	noWorlds=true
 	for wld in ${!worldInRam[*]}
@@ -565,7 +587,7 @@ toDisk(){
 		then
 			noWorlds=false
 			echo "Copying ${wld} to hard disk..."
-			rsync -rv ${RAMDISK}/${wld}/ ${WLDSTR}/${wld}
+			rsync -rv ${RAMDISK}/${wld}/ ${WLDSTR}/${wld}/
 		fi
 	done
 	[[ ${noWorlds} == true ]] && echo "No worlds present in ramdisk to copy back to hard disk"
@@ -578,7 +600,8 @@ checkLinks(){
 	# Linking to world storage when present only on disk
 	###############################################################
 	# Abort link checks if server is already running
-	[[ $(isRunning) ]] && echo "Cannot change world links while server is running. Please stop server and retry operation." && exit 1
+	( test -d ${WLDSTR} || mkdir -p ${WLDSTR} ) || ( echo "Error creating links: WLDSTR does not exist at ${WLDSTR}" >&2 && return 2 )
+	isRunning && echo "Cannot change world links while server is running. Please stop server and retry operation." >&2 && return 1
 	getWorlds
 	for wld in ${!worldInRam[*]}
 	do
@@ -603,7 +626,7 @@ checkLinks(){
 				echo "Links OK for ${wld}"
 			# If file already exists in server directory by name of symlink, raise error message and exit
 			else
-				echo "Unable to create link for world ${wld}: filename already exists in ${SRVDIR}"
+				echo "Unable to create link for world ${wld}: filename already exists in ${SRVDIR}" >&2
 				exit 1
 			fi
 		# If file does not exist, create new symlink from correct place
@@ -624,15 +647,8 @@ archiveWorlds(){
 	# Archives world storage directory
 	# Moves archive to a world backup directory (${WLDBK} directory)
 	#####################################################################
+	( test -d ${WLDBK} || mkdir -p ${WLDBK} ) || ( echo "Cannot archive worlds: WLDSTR does not exist at location ${WLDSTR}" >&2 && return 2 )
 	arcNum=0
-	[[ ! -d ${WLDSTR} ]] && echo "Cannot archive worlds: ${WLDSTR} either does not exist or isn't a directory" && exit 1
-	if [[ ! -d ${WLDBK} ]]
-	then 
-		echo "Attempting to create ${WLDBK}"
-		mkdir ${WLDBK}
-		[[ ! $? ]] && echo "Failed to create ${WLDBK}. Please create this directory and try again." && exit 1
-		echo "Created ${WLDBK} successfully"
-	fi
 	while [[ -f "${WLDBK}/worlds.${arcNum}.tar.gz" ]]
 	do
 		(( arcNum++ ))
@@ -657,7 +673,7 @@ archivePlugins(){
 	if [[ ! -d ${PLGBK} ]]
 	then 
 		echo "Attempting to create ${PLGBK}..."
-		mkdir ${PLGBK}
+		mkdir -p ${PLGBK}
 		[[ ! $? ]] && echo "Failed to create ${PLGBK}. Please create this directory and try again." && exit 1
 		echo "Created ${PLGBK} successfully"
 	fi
@@ -684,7 +700,7 @@ archiveServer(){
 	if [[ ! -d ${SRVBK} ]]
 	then 
 		echo "Attempting to create ${SRVBK}..."
-		mkdir ${SRVBK}
+		mkdir -p ${SRVBK}
 		[[ ! $? ]] && echo "Failed to create ${SRVBK}. Please create this directory and try again." && exit 1
 		echo "Created ${SRVBK} successfully"
 	fi
@@ -744,6 +760,60 @@ restoreArchive(){
 	fi
 }
 
+sessionExists(){
+	##########################################################
+	# Checks whether current value set in SESSION env variable
+	# exists as a tmux session
+	##########################################################
+	if [[ -n $(tmux list-sessions 2> /dev/null | egrep "^${SESSION}:\s") ]]
+	then
+		return 0
+	else
+		return 1
+	fi
+}
+
+findSessionName(){
+	##########################################################
+	# loops through possible tmux session names until a not-
+	# in-use session name is found and sets it as SESSION
+	##########################################################
+	if ! sessionExists
+	then
+		return 0
+	else
+		sessionBase=${SESSION}
+		i=$(printf "%02d" 00)
+		SESSION="${sessionBase}${i}"
+		until ! sessionExists
+		do
+			i=$(printf "%02d" $(( ++i )))
+			SESSION=${sessionBase}{$i}
+		done
+		return 0
+	fi
+}
+
+echoModeChange(){
+	##########################################################
+	# Announces server mode change both to players and to
+	# command-line invoker
+	# Takes 2 arguments
+	# $1: New mode (e.g. SHUTDOWN. RESTART)
+	# $2: Delay in seconds
+	##########################################################
+	echo -n "Server going on mode $1 in $2 seconds."
+	$0 exec "say Server going on $1 in $2 seconds." > /dev/null
+	sleep 1 && echo -n "." && seconds=1
+	$0 exec "say Contact server administrator for details." > /dev/null
+	until [[ ${seconds} -ge $2 ]]
+	do
+		echo -n "."
+		sleep 1 && (( ++seconds ))
+	done
+	echo
+	return 0
+}
 # Run script as unpriveliged user, execute script from server directory
 [[ ! $(cat /etc/passwd | egrep \(^${USER}:x:\)) ]] && echo "Cannot run server as ${USER}; user does not exist" && exit 1
 if [[ $(whoami) != ${USER} ]] 
